@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
-"""Lightweight local YouTube downloader with a web UI."""
+"""Lightweight YouTube downloader with a web UI."""
 
 import json
+import os
 import re
+import shutil
+import tempfile
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 import yt_dlp
 
-DOWNLOAD_DIR = str(Path.home() / "Downloads")
-PORT = 8080
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_PATH = None
+
+PORT = int(os.environ.get("PORT", 8080))
+HOST = "0.0.0.0"
+
+# token -> (tmpdir, filepath, filename)
+_downloads: dict = {}
+_downloads_lock = threading.Lock()
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -97,7 +111,7 @@ async function startDownload() {
   if (!url) { setStatus('Please enter a URL.', 'error'); return; }
   btn.disabled = true;
   btn.textContent = 'Downloading...';
-  setStatus('Starting download...', 'info');
+  setStatus('Fetching from YouTube...', 'info');
   try {
     const res = await fetch('/download', {
       method: 'POST',
@@ -106,7 +120,8 @@ async function startDownload() {
     });
     const data = await res.json();
     if (data.ok) {
-      setStatus('Done! Saved to: ' + data.filename, 'success');
+      setStatus('Ready: ' + data.filename + ' — starting download...', 'success');
+      window.location.assign('/file/' + encodeURIComponent(data.token));
     } else {
       setStatus('Error: ' + data.error, 'error');
     }
@@ -128,12 +143,78 @@ YOUTUBE_RE = re.compile(
 )
 
 
+def download(url: str, fmt: str):
+    """Download to a fresh temp dir. Returns (tmpdir, filepath, filename)."""
+    tmpdir = tempfile.mkdtemp(prefix="ytdl_")
+    opts = {
+        "outtmpl": f"{tmpdir}/%(title)s.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if FFMPEG_PATH:
+        opts["ffmpeg_location"] = FFMPEG_PATH
+
+    if fmt == "mp3":
+        opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+    else:
+        opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        opts["merge_output_format"] = "mp4"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if fmt == "mp3":
+                filepath = os.path.splitext(filepath)[0] + ".mp3"
+        return tmpdir, filepath, os.path.basename(filepath)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(HTML_PAGE.encode())
+        if self.path in ("/", "/index.html"):
+            body = HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path.startswith("/file/"):
+            token = self.path[len("/file/"):]
+            with _downloads_lock:
+                entry = _downloads.pop(token, None)
+            if not entry:
+                self._json(404, {"ok": False, "error": "Not found or expired"})
+                return
+            tmpdir, filepath, filename = entry
+            try:
+                size = os.path.getsize(filepath)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename*=UTF-8''{quote(filename)}",
+                )
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=65536)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            return
+
+        self._json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self):
         if self.path != "/download":
@@ -150,54 +231,29 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            filename = download(url, fmt)
-            self._json(200, {"ok": True, "filename": filename})
+            tmpdir, filepath, filename = download(url, fmt)
+            token = uuid.uuid4().hex
+            with _downloads_lock:
+                _downloads[token] = (tmpdir, filepath, filename)
+            self._json(200, {"ok": True, "token": token, "filename": filename})
         except Exception as e:
             self._json(500, {"ok": False, "error": str(e)})
 
     def _json(self, code, data):
+        payload = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(payload)
 
     def log_message(self, format, *args):
         print(f"  {args[0]}")
 
 
-def download(url: str, fmt: str) -> str:
-    """Download a YouTube video/audio and return the resulting filename."""
-    opts = {
-        "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    if fmt == "mp3":
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    else:
-        opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        opts["merge_output_format"] = "mp4"
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # yt-dlp may change the extension after post-processing
-        if fmt == "mp3":
-            return info.get("title", "download") + ".mp3"
-        return ydl.prepare_filename(info).split("/")[-1]
-
-
 if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"YT Downloader running at http://localhost:{PORT}")
-    print("Press Ctrl+C to stop.\n")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"YT Downloader running on http://{HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
